@@ -1,0 +1,152 @@
+import os
+import time
+from typing import Optional
+import requests
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+app = FastAPI(title="OiiO Bot Core Engine", version="1.2.0")
+
+# 1. อนุญาตให้หน้าเว็บ Bolt.host และ Manus.space เรียกใช้งานได้ (CORS)
+origins = [
+    "https://oiio-bot.bolt.host",
+    "https://oiiobot-dxjhgjyu.manus.space",
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:5173",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 2. ระบบเก็บ API Key และ Token Credits เบื้องต้น
+API_KEY_CREDITS = {
+    "sk-oiio-demo": 10000,
+}
+
+MASTER_OIIO_KEY = os.getenv("OIIO_API_KEY", "sk-oiio-demo")
+if MASTER_OIIO_KEY not in API_KEY_CREDITS:
+    API_KEY_CREDITS[MASTER_OIIO_KEY] = 10000
+
+
+class ChatCompletionRequest(BaseModel):
+    prompt: str
+    model: str = "oiio-master"
+    provider_api_key: Optional[str] = None
+
+
+class ChatCompletionResponse(BaseModel):
+    status: str
+    model: str
+    researcher_output: str
+    builder_output: str
+    reviewer_output: str
+    final_answer: str
+    credits_used: int
+    credits_remaining: int
+    latency_ms: int
+
+
+def verify_bearer_token(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer sk-oiio-... token")
+    token = authorization.replace("Bearer ", "", 1).strip()
+    if not token.startswith("sk-oiio-") or token not in API_KEY_CREDITS:
+        raise HTTPException(status_code=401, detail="Invalid OiiO API Key")
+    return token
+
+
+def call_gemini(system_role: str, user_text: str, api_key: str) -> str:
+    if not api_key:
+        return f"[{system_role}] (โหมดจำลอง - กรุณาใส่ GEMINI_API_KEY): วิเคราะห์ข้อมูลสำหรับ '{user_text}' เรียบร้อยแล้ว"
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    payload = {
+        "contents": [{
+            "parts": [{"text": f"บทบาทของคุณคือ: {system_role}\n\nคำสั่งงาน: {user_text}"}]
+        }]
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=30)
+        res.raise_for_status()
+        data = res.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        return f"[{system_role}] เกิดข้อผิดพลาดในการเรียก AI: {str(e)}"
+
+
+# 3. Endpoint เช็กสถานะเซิร์ฟเวอร์ (ไม่เสีย Token Credit)
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "oiio-bot-core-engine", "version": "1.2.0"}
+
+
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "OiiO Bot Core Engine is running."}
+
+
+# 4. Endpoint หลักสำหรับรันทีม Agent (@Researcher -> @Builder -> @Reviewer)
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def chat_completions(
+    payload: ChatCompletionRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    start_time = time.time()
+    api_key = verify_bearer_token(authorization)
+
+    current_credits = API_KEY_CREDITS.get(api_key, 0)
+    if current_credits <= 0:
+        raise HTTPException(status_code=402, detail="Insufficient Token Credits")
+
+    # ดึง Gemini API Key จากที่ส่งมาจากหน้าเว็บ หรือจาก Environment Variable บน Render
+    gemini_key = payload.provider_api_key or os.getenv("GEMINI_API_KEY", "")
+
+    # ขั้นที่ 1: @Researcher หาข้อมูล
+    researcher_out = call_gemini(
+        "@Researcher ผู้เชี่ยวชาญการวิเคราะห์ข้อมูลและประเมินความเสี่ยง สรุปประเด็นสำคัญอย่างกระชับ",
+        payload.prompt,
+        gemini_key
+    )
+
+    # ขั้นที่ 2: @Builder วางโครงสร้าง/ลงมือทำ
+    builder_out = call_gemini(
+        "@Builder สถาปนิกและนักพัฒนา ออกแบบโครงสร้าง แผนงาน หรือเขียนโค้ดจากข้อมูลนี้",
+        f"โจทย์หลัก: {payload.prompt}\nข้อมูลจาก Researcher: {researcher_out}",
+        gemini_key
+    )
+
+    # ขั้นที่ 3: @Reviewer ตรวจสอบคุณภาพและสรุปผล
+    reviewer_out = call_gemini(
+        "@Reviewer ผู้ตรวจสอบคุณภาพ ตรวจหาจุดบกพร่องและสรุปคำตอบสุดท้ายที่สมบูรณ์พร้อมใช้งาน",
+        f"โจทย์หลัก: {payload.prompt}\nผลงานจาก Builder: {builder_out}",
+        gemini_key
+    )
+
+    # คำนวณและหัก Token Credit
+    total_chars = len(payload.prompt) + len(researcher_out) + len(builder_out) + len(reviewer_out)
+    credits_used = max(30, total_chars // 50)
+
+    if current_credits < credits_used:
+        raise HTTPException(status_code=402, detail="Not enough credits for this task")
+
+    API_KEY_CREDITS[api_key] = current_credits - credits_used
+    latency_ms = int((time.time() - start_time) * 1000)
+
+    return ChatCompletionResponse(
+        status="success",
+        model=payload.model,
+        researcher_output=researcher_out,
+        builder_output=builder_out,
+        reviewer_output=reviewer_out,
+        final_answer=reviewer_out,
+        credits_used=credits_used,
+        credits_remaining=API_KEY_CREDITS[api_key],
+        latency_ms=latency_ms,
+    )
